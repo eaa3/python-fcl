@@ -1,4 +1,4 @@
-from libcpp cimport bool
+from libcpp cimport bool as cppbool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 from libc.stdlib cimport free
@@ -7,13 +7,18 @@ import inspect
 
 from cython.operator cimport dereference as deref, preincrement as inc, address
 cimport numpy as np
-import numpy
+import numpy as np
 ctypedef np.float64_t DOUBLE_t
 
 cimport fcl_defs as defs
-cimport octomap_defs as octomap 
-cimport std_defs as std 
+cimport octomap_defs as octomap
+cimport dynamicEDT3D_defs as edt
 from collision_data import Contact, CostSource, CollisionRequest, ContinuousCollisionRequest, CollisionResult, ContinuousCollisionResult, DistanceRequest, DistanceResult
+
+
+ctypedef octomap.OccupancyOcTreeBase[octomap.OcTreeNode].tree_iterator* tree_iterator_ptr
+ctypedef octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_iterator* leaf_iterator_ptr
+ctypedef octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_bbx_iterator* leaf_bbx_iterator_ptr
 
 ###############################################################################
 # Transforms
@@ -28,7 +33,7 @@ cdef class Transform:
             if isinstance(args[0], Transform):
                 self.thisptr = new defs.Transform3f(deref((<Transform> args[0]).thisptr))
             else:
-                data = numpy.array(args[0])
+                data = np.array(args[0])
                 if data.shape == (3,3):
                     self.thisptr = new defs.Transform3f(numpy_to_mat3f(data))
                 elif data.shape == (4,):
@@ -38,8 +43,8 @@ cdef class Transform:
                 else:
                     raise ValueError('Invalid input to Transform().')
         elif len(args) == 2:
-            rot = numpy.array(args[0])
-            trans = numpy.array(args[1]).squeeze()
+            rot = np.array(args[0])
+            trans = np.array(args[1]).squeeze()
             if not trans.shape == (3,):
                 raise ValueError('Translation must be (3,).')
 
@@ -81,7 +86,7 @@ cdef class Transform:
 cdef class CollisionObject:
     cdef defs.CollisionObject *thisptr
     cdef defs.PyObject *geom
-    cdef bool _no_instance
+    cdef cppbool _no_instance
 
     def __cinit__(self, CollisionGeometry geom=None, Transform tf=None, _no_instance=False):
         if geom is None:
@@ -395,18 +400,877 @@ cdef class BVHModel(CollisionGeometry):
         else:
             return False
 
+
+class NullPointerException(Exception):
+    """
+    Null pointer exception
+    """
+    def __init__(self):
+        pass
+
+cdef class OcTreeKey:
+    """
+    OcTreeKey is a container class for internal key addressing.
+    The keys count the number of cells (voxels) from the origin as discrete address of a voxel.
+    """
+    cdef octomap.OcTreeKey *thisptr
+    def __cinit__(self):
+        self.thisptr = new octomap.OcTreeKey()
+    def __dealloc__(self):
+        if self.thisptr:
+            del self.thisptr
+    def __setitem__(self, key, value):
+        self.thisptr[0][key] = value
+    def __getitem__(self, key):
+        return self.thisptr[0][key]
+    def __richcmp__(self, other, int op):
+        if op == 2:
+            return (self.thisptr[0][0] == other[0] and \
+                    self.thisptr[0][1] == other[1] and \
+                    self.thisptr[0][2] == other[2])
+        elif op == 3:
+            return not (self.thisptr[0][0] == other[0] and \
+                        self.thisptr[0][1] == other[1] and \
+                        self.thisptr[0][2] == other[2])
+
+cdef class OcTreeNode:
+    """
+    Nodes to be used in OcTree.
+    They represent 3d occupancy grid cells. "value" stores their log-odds occupancy.
+    """
+    cdef octomap.OcTreeNode *thisptr
+    def __cinit__(self):
+        pass
+    def __dealloc__(self):
+        pass
+    def addValue(self, float p):
+        """
+        adds p to the node's logOdds value (with no boundary / threshold checking!)
+        """
+        if self.thisptr:
+            self.thisptr.addValue(p)
+        else:
+            raise NullPointerException
+    def childExists(self, unsigned int i):
+        """
+        Safe test to check of the i-th child exists,
+        first tests if there are any children.
+        """
+        if self.thisptr:
+            return self.thisptr.childExists(i)
+        else:
+            raise NullPointerException
+    def getValue(self):
+        if self.thisptr:
+            return self.thisptr.getValue()
+        else:
+            raise NullPointerException
+    def setValue(self, float v):
+        if self.thisptr:
+            self.thisptr.setValue(v)
+        else:
+            raise NullPointerException
+    def getOccupancy(self):
+        if self.thisptr:
+            return self.thisptr.getOccupancy()
+        else:
+            raise NullPointerException
+    def getLogOdds(self):
+        if self.thisptr:
+            return self.thisptr.getLogOdds()
+        else:
+            raise NullPointerException
+    def setLogOdds(self, float l):
+        if self.thisptr:
+            self.thisptr.setLogOdds(l)
+        else:
+            raise NullPointerException
+    def hasChildren(self):
+        if self.thisptr:
+            return self.thisptr.hasChildren()
+        else:
+            raise NullPointerException
+
+cdef class iterator_base:
+    """
+    Iterator over the complete tree (inner nodes and leafs).
+    """
+    cdef octomap.OcTree *treeptr
+    cdef octomap.OccupancyOcTreeBase[octomap.OcTreeNode].iterator_base *thisptr
+    def __cinit__(self):
+        pass
+
+    def __dealloc__(self):
+        if self.thisptr:
+            del self.thisptr
+
+    def __is_end(self):
+        return deref(self.thisptr) == self.treeptr.end_tree()
+
+    def __is_acceseable(self):
+        if self.thisptr and self.treeptr:
+            if not self.__is_end():
+                return True
+        return False
+
+    def getCoordinate(self):
+        """
+        return the center coordinate of the current node
+        """
+        cdef octomap.Vector3 pt
+        if self.__is_acceseable():
+            pt = self.thisptr.getCoordinate()
+            return np.array((pt.x(), pt.y(), pt.z()))
+        else:
+            raise NullPointerException
+
+    def getDepth(self):
+        if self.__is_acceseable():
+            return self.thisptr.getDepth()
+        else:
+            raise NullPointerException
+
+    def getKey(self):
+        """
+        the OcTreeKey of the current node
+        """
+        if self.__is_acceseable():
+            key = OcTreeKey()
+            key.thisptr[0][0] = self.thisptr.getKey()[0]
+            key.thisptr[0][1] = self.thisptr.getKey()[1]
+            key.thisptr[0][2] = self.thisptr.getKey()[2]
+            return key
+        else:
+            raise NullPointerException
+
+    def getIndexKey(self):
+        """
+        the OcTreeKey of the current node, for nodes with depth != maxDepth
+        """
+        if self.__is_acceseable():
+            key = OcTreeKey()
+            key.thisptr[0][0] = self.thisptr.getIndexKey()[0]
+            key.thisptr[0][1] = self.thisptr.getIndexKey()[1]
+            key.thisptr[0][2] = self.thisptr.getIndexKey()[2]
+            return key
+        else:
+            raise NullPointerException
+
+    def getSize(self):
+        if self.__is_acceseable():
+            return self.thisptr.getSize()
+        else:
+            raise NullPointerException
+
+    def getX(self):
+        if self.__is_acceseable():
+            return self.thisptr.getX()
+        else:
+            raise NullPointerException
+    def getY(self):
+        if self.__is_acceseable():
+            return self.thisptr.getY()
+        else:
+            raise NullPointerException
+    def getZ(self):
+        if self.__is_acceseable():
+            return self.thisptr.getZ()
+        else:
+            raise NullPointerException
+
+    def getOccupancy(self):
+        if self.__is_acceseable():
+            return (<octomap.OcTreeNode>deref(deref(self.thisptr))).getOccupancy()
+        else:
+            raise NullPointerException
+
+    def getValue(self):
+        if self.__is_acceseable():
+            return (<octomap.OcTreeNode>deref(deref(self.thisptr))).getValue()
+        else:
+            raise NullPointerException
+
+
+cdef class tree_iterator(iterator_base):
+    """
+    Iterator over the complete tree (inner nodes and leafs).
+    """
+    def __cinit__(self):
+        pass
+
+    def next(self):
+        if self.thisptr and self.treeptr:
+            if not self.__is_end():
+                inc(deref(octomap.static_cast[tree_iterator_ptr](self.thisptr)))
+                return self
+            else:
+                raise StopIteration
+        else:
+            raise NullPointerException
+
+    def __iter__(self):
+        if self.thisptr and self.treeptr:
+            while not self.__is_end():
+                yield self
+                if self.thisptr:
+                    inc(deref(octomap.static_cast[tree_iterator_ptr](self.thisptr)))
+                else:
+                    break
+        else:
+            raise NullPointerException
+
+    def isLeaf(self):
+        if self.__is_acceseable():
+            return octomap.static_cast[tree_iterator_ptr](self.thisptr).isLeaf()
+        else:
+            raise NullPointerException
+
+cdef class leaf_iterator(iterator_base):
+    """
+    Iterator over the complete tree (leafs).
+    """
+    def __cinit__(self):
+        pass
+
+    def next(self):
+        if self.thisptr and self.treeptr:
+            if not self.__is_end():
+                inc(deref(octomap.static_cast[leaf_iterator_ptr](self.thisptr)))
+                return self
+            else:
+                raise StopIteration
+        else:
+            raise NullPointerException
+
+    def __iter__(self):
+        if self.thisptr and self.treeptr:
+            while not self.__is_end():
+                yield self
+                if self.thisptr:
+                    inc(deref(octomap.static_cast[leaf_iterator_ptr](self.thisptr)))
+                else:
+                    break
+        else:
+            raise NullPointerException
+
+cdef class leaf_bbx_iterator(iterator_base):
+    """
+    Iterator over the complete tree (leafs).
+    """
+    def __cinit__(self):
+        pass
+
+    def next(self):
+        if self.thisptr and self.treeptr:
+            if not self.__is_end():
+                inc(deref(octomap.static_cast[leaf_bbx_iterator_ptr](self.thisptr)))
+                return self
+            else:
+                raise StopIteration
+        else:
+            raise NullPointerException
+
+    def __iter__(self):
+        if self.thisptr and self.treeptr:
+            while not self.__is_end():
+                yield self
+                if self.thisptr:
+                    inc(deref(octomap.static_cast[leaf_bbx_iterator_ptr](self.thisptr)))
+                else:
+                    break
+        else:
+            raise NullPointerException
+
+def _octree_read(filename):
+    """
+    Read the file header, create the appropriate class and deserialize.
+    This creates a new octree which you need to delete yourself.
+    """
+    cdef octomap.istringstream iss
+    cdef ExOcTree tree = ExOcTree(0.1)
+    if filename.startswith(b"# Octomap OcTree file"):
+        iss.str(string(<char*?>filename, len(filename)))
+        del tree.thistree
+        tree.thistree = <octomap.OcTree*>tree.thistree.read(<octomap.istream&?>iss)
+        return tree
+    else:
+        del tree.thistree
+        tree.thistree = <octomap.OcTree*>tree.thistree.read(string(<char*?>filename))
+        return tree
+
+cdef class ExOcTree:
+    """
+    octomap main map data structure, stores 3D occupancy grid map in an OcTree.
+    """
+    cdef octomap.OcTree *thistree
+    cdef edt.DynamicEDTOctomap *edtptr
+    def __cinit__(self, arg):
+        import numbers
+        if isinstance(arg, numbers.Number):
+            self.thistree = new octomap.OcTree(<double?>arg)
+        else:
+            self.thistree = new octomap.OcTree(string(<char*?>arg))
+
+
+    def __dealloc__(self):
+        pass
+        # if self.thistree:
+        #     del self.thistree
+        if self.edtptr:
+            del self.edtptr
+
+    def adjustKeyAtDepth(self, OcTreeKey key, depth):
+        cdef octomap.OcTreeKey key_in = octomap.OcTreeKey()
+        key_in[0] = key[0]
+        key_in[1] = key[1]
+        key_in[2] = key[2]
+        cdef octomap.OcTreeKey key_out = self.thistree.adjustKeyAtDepth(key_in, <int?>depth)
+        res = OcTreeKey
+        res[0] = key_out[0]
+        res[1] = key_out[1]
+        res[2] = key_out[2]
+        return res
+
+    def bbxSet(self):
+        return self.thistree.bbxSet()
+
+    def calcNumNodes(self):
+        return self.thistree.calcNumNodes()
+
+    def clear(self):
+        self.thistree.clear()
+
+    def coordToKey(self, np.ndarray[DOUBLE_t, ndim=1] coord, depth=None):
+        cdef octomap.OcTreeKey key
+        if depth is None:
+            key = self.thistree.coordToKey(octomap.point3d(coord[0],
+                                                       coord[1],
+                                                       coord[2]))
+        else:
+            key = self.thistree.coordToKey(octomap.point3d(coord[0],
+                                                       coord[1],
+                                                       coord[2]),
+                                          <unsigned int?>depth)
+        res = OcTreeKey()
+        res[0] = key[0]
+        res[1] = key[1]
+        res[2] = key[2]
+        return res
+
+    def coordToKeyChecked(self, np.ndarray[DOUBLE_t, ndim=1] coord, depth=None):
+        cdef octomap.OcTreeKey key
+        cdef cppbool chk
+        if depth is None:
+            chk = self.thistree.coordToKeyChecked(octomap.point3d(coord[0],
+                                                              coord[1],
+                                                              coord[2]),
+                                                 key)
+        else:
+            chk = self.thistree.coordToKeyChecked(octomap.point3d(coord[0],
+                                                              coord[1],
+                                                              coord[2]),
+                                                 <unsigned int?>depth,
+                                                 key)
+        if chk:
+            res = OcTreeKey()
+            res[0] = key[0]
+            res[1] = key[1]
+            res[2] = key[2]
+            return chk, res
+        else:
+            return chk, None
+
+    def deleteNode(self, np.ndarray[DOUBLE_t, ndim=1] value, depth=1):
+        return self.thistree.deleteNode(octomap.point3d(value[0],
+                                                    value[1],
+                                                    value[2]),
+                                       <int?>depth)
+
+    def castRay(self, np.ndarray[DOUBLE_t, ndim=1] origin,
+                np.ndarray[DOUBLE_t, ndim=1] direction,
+                np.ndarray[DOUBLE_t, ndim=1] end,
+                ignoreUnknownCells=False,
+                maxRange=-1.0):
+        """
+        A ray is cast from origin with a given direction,
+        the first occupied cell is returned (as center coordinate).
+        If the starting coordinate is already occupied in the tree,
+        this coordinate will be returned as a hit.
+        """
+        cdef octomap.point3d e
+        cdef cppbool hit
+        hit = self.thistree.castRay(
+            octomap.point3d(origin[0], origin[1], origin[2]),
+            octomap.point3d(direction[0], direction[1], direction[2]),
+            e,
+            bool(ignoreUnknownCells),
+            <double?>maxRange
+        )
+        if hit:
+            end[0:3] = e.x(), e.y(), e.z()
+        return hit
+
+    read = _octree_read
+
+    def write(self, filename=None):
+        """
+        Write file header and complete tree to file/stream (serialization)
+        """
+        cdef octomap.ostringstream oss
+        if not filename is None:
+            return self.thistree.write(string(<char*?>filename))
+        else:
+            ret = self.thistree.write(<octomap.ostream&?>oss)
+            if ret:
+                return oss.str().c_str()[:oss.str().length()]
+            else:
+                return False
+
+    def readBinary(self, filename):
+        cdef octomap.istringstream iss
+        if filename.startswith(b"# Octomap OcTree binary file"):
+            iss.str(string(<char*?>filename, len(filename)))
+            return self.thistree.readBinary(<octomap.istream&?>iss)
+        else:
+            return self.thistree.readBinary(string(<char*?>filename))
+
+    def writeBinary(self, filename=None):
+        cdef octomap.ostringstream oss
+        if not filename is None:
+            return self.thistree.writeBinary(string(<char*?>filename))
+        else:
+            ret = self.thistree.writeBinary(<octomap.ostream&?>oss)
+            if ret:
+                return oss.str().c_str()[:oss.str().length()]
+            else:
+                return False
+
+    def isNodeOccupied(self, node):
+        if isinstance(node, OcTreeNode):
+            if (<OcTreeNode>node).thisptr:
+                return self.thistree.isNodeOccupied(deref((<OcTreeNode>node).thisptr))
+            else:
+                raise NullPointerException
+        else:
+            return self.thistree.isNodeOccupied(<octomap.OcTreeNode>deref(deref((<tree_iterator>node).thisptr)))
+
+    def isNodeAtThreshold(self, node):
+        if isinstance(node, OcTreeNode):
+            if (<OcTreeNode>node).thisptr:
+                return self.thistree.isNodeAtThreshold(deref((<OcTreeNode>node).thisptr))
+            else:
+                raise NullPointerException
+        else:
+            return self.thistree.isNodeAtThreshold(<octomap.OcTreeNode>deref(deref((<tree_iterator>node).thisptr)))
+
+    def insertPointCloud(self,
+                         np.ndarray[DOUBLE_t, ndim=2] pointcloud,
+                         np.ndarray[DOUBLE_t, ndim=1] origin,
+                         maxrange=-1.,
+                         lazy_eval=False,
+                         discretize=False):
+        """
+        Integrate a Pointcloud (in global reference frame), parallelized with OpenMP.
+
+        Special care is taken that each voxel in the map is updated only once, and occupied
+        nodes have a preference over free ones. This avoids holes in the floor from mutual
+        deletion.
+        :param pointcloud: Pointcloud (measurement endpoints), in global reference frame
+        :param origin: measurement origin in global reference frame
+        :param maxrange: maximum range for how long individual beams are inserted (default -1: complete beam)
+        :param : whether update of inner nodes is omitted after the update (default: false).
+        This speeds up the insertion, but you need to call updateInnerOccupancy() when done.
+        """
+        cdef octomap.Pointcloud pc = octomap.Pointcloud()
+        for p in pointcloud:
+            pc.push_back(<float>p[0],
+                         <float>p[1],
+                         <float>p[2])
+
+        self.thistree.insertPointCloud(pc,
+                                      octomap.Vector3(<float>origin[0],
+                                                   <float>origin[1],
+                                                   <float>origin[2]),
+                                      <double?>maxrange,
+                                      bool(lazy_eval),
+                                      bool(discretize))
+
+    def begin_tree(self, maxDepth=0):
+        itr = tree_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].tree_iterator(self.thistree.begin_tree(maxDepth))
+        itr.treeptr = self.thistree
+        return itr
+
+    def begin_leafs(self, maxDepth=0):
+        itr = leaf_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_iterator(self.thistree.begin_leafs(maxDepth))
+        itr.treeptr = self.thistree
+        return itr
+
+    def begin_leafs_bbx(self, np.ndarray[DOUBLE_t, ndim=1] bbx_min, np.ndarray[DOUBLE_t, ndim=1] bbx_max, maxDepth=0):
+        itr = leaf_bbx_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_bbx_iterator(self.thistree.begin_leafs_bbx(octomap.point3d(bbx_min[0], bbx_min[1], bbx_min[2]),
+                                                                                                                   octomap.point3d(bbx_max[0], bbx_max[1], bbx_max[2]),
+                                                                                                                   maxDepth))
+        itr.treeptr = self.thistree
+        return itr
+
+    def end_tree(self):
+        itr = tree_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].tree_iterator(self.thistree.end_tree())
+        itr.treeptr = self.thistree
+        return itr
+
+    def end_leafs(self):
+        itr = leaf_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_iterator(self.thistree.end_leafs())
+        itr.treeptr = self.thistree
+        return itr
+
+    def end_leafs_bbx(self):
+        itr = leaf_bbx_iterator()
+        itr.thisptr = new octomap.OccupancyOcTreeBase[octomap.OcTreeNode].leaf_bbx_iterator(self.thistree.end_leafs_bbx())
+        itr.treeptr = self.thistree
+        return itr
+
+    def getBBXBounds(self):
+        cdef octomap.point3d p = self.thistree.getBBXBounds()
+        return np.array((p.x(), p.y(), p.z()))
+
+    def getBBXCenter(self):
+        cdef octomap.point3d p = self.thistree.getBBXCenter()
+        return np.array((p.x(), p.y(), p.z()))
+
+    def getBBXMax(self):
+        cdef octomap.point3d p = self.thistree.getBBXMax()
+        return np.array((p.x(), p.y(), p.z()))
+
+    def getBBXMin(self):
+        cdef octomap.point3d p = self.thistree.getBBXMin()
+        return np.array((p.x(), p.y(), p.z()))
+
+    def getRoot(self):
+        node = OcTreeNode()
+        node.thisptr = self.thistree.getRoot()
+        return node
+
+    def getNumLeafNodes(self):
+        return self.thistree.getNumLeafNodes()
+
+    def getResolution(self):
+        return self.thistree.getResolution()
+
+    def getTreeDepth(self):
+        return self.thistree.getTreeDepth()
+
+    def getTreeType(self):
+        return self.thistree.getTreeType().c_str()
+
+    def inBBX(self, np.ndarray[DOUBLE_t, ndim=1] p):
+        return self.thistree.inBBX(octomap.point3d(p[0], p[1], p[2]))
+
+    def keyToCoord(self, OcTreeKey key, depth=None):
+        cdef octomap.OcTreeKey key_in = octomap.OcTreeKey()
+        cdef octomap.point3d p = octomap.point3d()
+        key_in[0] = key[0]
+        key_in[1] = key[1]
+        key_in[2] = key[2]
+        if depth is None:
+            p = self.thistree.keyToCoord(key_in)
+        else:
+            p = self.thistree.keyToCoord(key_in, <int?>depth)
+        return np.array((p.x(), p.y(), p.z()))
+
+    def memoryFullGrid(self):
+        return self.thistree.memoryFullGrid()
+
+    def memoryUsage(self):
+        return self.thistree.memoryUsage()
+
+    def memoryUsageNode(self):
+        return self.thistree.memoryUsageNode()
+
+    def resetChangeDetection(self):
+        """
+        Reset the set of changed keys. Call this after you obtained all changed nodes.
+        """
+        self.thistree.resetChangeDetection()
+
+    def search(self, value, depth=0):
+        node = OcTreeNode()
+        if isinstance(value, OcTreeKey):
+            node.thisptr = self.thistree.search(octomap.OcTreeKey(<unsigned short int>value[0],
+                                                              <unsigned short int>value[1],
+                                                              <unsigned short int>value[2]),
+                                               <unsigned int?>depth)
+        else:
+            node.thisptr = self.thistree.search(<double>value[0],
+                                               <double>value[1],
+                                               <double>value[2],
+                                               <unsigned int?>depth)
+        return node
+
+    def setBBXMax(self, np.ndarray[DOUBLE_t, ndim=1] max):
+        """
+        sets the maximum for a query bounding box to use
+        """
+        self.thistree.setBBXMax(octomap.point3d(max[0], max[1], max[2]))
+
+    def setBBXMin(self, np.ndarray[DOUBLE_t, ndim=1] min):
+        """
+        sets the minimum for a query bounding box to use
+        """
+        self.thistree.setBBXMin(octomap.point3d(min[0], min[1], min[2]))
+
+    def setResolution(self, double r):
+        """
+        Change the resolution of the octree, scaling all voxels. This will not preserve the (metric) scale!
+        """
+        self.thistree.setResolution(r)
+
+    def size(self):
+        return self.thistree.size()
+
+    def toMaxLikelihood(self):
+        """
+        Creates the maximum likelihood map by calling toMaxLikelihood on all tree nodes,
+        setting their occupancy to the corresponding occupancy thresholds.
+        """
+        self.thistree.toMaxLikelihood()
+
+    def updateNodes(self, values, update, lazy_eval=False):
+        """
+        Integrate occupancy measurements and Manipulate log_odds value of voxel directly. 
+        """
+        if values is None or len(values) == 0:
+            return
+        if isinstance(values[0], OcTreeKey):
+            if isinstance(update, bool):
+                for v in values:
+                    self.thistree.updateNode(octomap.OcTreeKey(<unsigned short int>v[0],
+                                                           <unsigned short int>v[1],
+                                                           <unsigned short int>v[2]),
+                                            <cppbool>update,
+                                            <cppbool?>lazy_eval)
+            else:
+                for v in values:
+                    self.thistree.updateNode(octomap.OcTreeKey(<unsigned short int>v[0],
+                                                           <unsigned short int>v[1],
+                                                           <unsigned short int>v[2]),
+                                            <float?>update,
+                                            <cppbool?>lazy_eval)
+        else:
+            if isinstance(update, bool):
+                for v in values:
+                    self.thistree.updateNode(<double?>v[0],
+                                            <double?>v[1],
+                                            <double?>v[2],
+                                            <cppbool>update,
+                                            <cppbool?>lazy_eval)
+            else:
+                for v in values:
+                    self.thistree.updateNode(<double?>v[0],
+                                            <double?>v[1],
+                                            <double?>v[2],
+                                            <float?>update,
+                                            <cppbool?>lazy_eval)
+
+    def updateNode(self, value, update, lazy_eval=False):
+        """
+        Integrate occupancy measurement and Manipulate log_odds value of voxel directly. 
+        """
+        node = OcTreeNode()
+        if isinstance(value, OcTreeKey):
+            if isinstance(update, bool):
+                node.thisptr = self.thistree.updateNode(octomap.OcTreeKey(<unsigned short int>value[0],
+                                                                      <unsigned short int>value[1],
+                                                                      <unsigned short int>value[2]),
+                                                       <cppbool>update,
+                                                       <cppbool?>lazy_eval)
+            else:
+                node.thisptr = self.thistree.updateNode(octomap.OcTreeKey(<unsigned short int>value[0],
+                                                                      <unsigned short int>value[1],
+                                                                      <unsigned short int>value[2]),
+                                                       <float?>update,
+                                                       <cppbool?>lazy_eval)
+        else:
+            if isinstance(update, bool):
+                node.thisptr = self.thistree.updateNode(<double?>value[0],
+                                                       <double?>value[1],
+                                                       <double?>value[2],
+                                                       <cppbool>update,
+                                                       <cppbool?>lazy_eval)
+            else:
+                node.thisptr = self.thistree.updateNode(<double?>value[0],
+                                                       <double?>value[1],
+                                                       <double?>value[2],
+                                                       <float?>update,
+                                                       <cppbool?>lazy_eval)
+        return node
+
+    def updateInnerOccupancy(self):
+        """
+        Updates the occupancy of all inner nodes to reflect their children's occupancy.
+        """
+        self.thistree.updateInnerOccupancy()
+
+    def useBBXLimit(self, enable):
+        """
+        use or ignore BBX limit (default: ignore)
+        """
+        self.thistree.useBBXLimit(bool(enable))
+
+    def volume(self):
+        return self.thistree.volume()
+
+    def getClampingThresMax(self):
+        return self.thistree.getClampingThresMax()
+
+    def getClampingThresMaxLog(self):
+        return self.thistree.getClampingThresMaxLog()
+
+    def getClampingThresMin(self):
+        return self.thistree.getClampingThresMin()
+
+    def getClampingThresMinLog(self):
+        return self.thistree.getClampingThresMinLog()
+
+    def getOccupancyThres(self):
+        return self.thistree.getOccupancyThres()
+
+    def getOccupancyThresLog(self):
+        return self.thistree.getOccupancyThresLog()
+
+    def getProbHit(self):
+        return self.thistree.getProbHit()
+
+    def getProbHitLog(self):
+        return self.thistree.getProbHitLog()
+
+    def getProbMiss(self):
+        return self.thistree.getProbMiss()
+
+    def getProbMissLog(self):
+        return self.thistree.getProbMissLog()
+
+    def setClampingThresMax(self, double thresProb):
+        self.thistree.setClampingThresMax(thresProb)
+
+    def setClampingThresMin(self, double thresProb):
+        self.thistree.setClampingThresMin(thresProb)
+
+    def setOccupancyThres(self, double prob):
+        self.thistree.setOccupancyThres(prob)
+
+    def setProbHit(self, double prob):
+        self.thistree.setProbHit(prob)
+
+    def setProbMiss(self, double prob):
+        self.thistree.setProbMiss(prob)
+
+    def getMetricSize(self):
+        cdef double x = 0
+        cdef double y = 0
+        cdef double z = 0
+        self.thistree.getMetricSize(x, y, z)
+        return (x, y, z)
+
+    def getMetricMin(self):
+        cdef double x = 0
+        cdef double y = 0
+        cdef double z = 0
+        self.thistree.getMetricMin(x, y, z)
+        return (x, y, z)
+
+    def getMetricMax(self):
+        cdef double x = 0
+        cdef double y = 0
+        cdef double z = 0
+        self.thistree.getMetricMax(x, y, z)
+        return (x, y, z)
+
+    def expandNode(self, node):
+        self.thistree.expandNode((<OcTreeNode>node).thisptr)
+
+    def createNodeChild(self, node, int idx):
+        child = OcTreeNode()
+        child.thisptr = self.thistree.createNodeChild((<OcTreeNode>node).thisptr, idx)
+        return child
+
+    def getNodeChild(self, node, int idx):
+        child = OcTreeNode()
+        child.thisptr = self.thistree.getNodeChild((<OcTreeNode>node).thisptr, idx)
+        return child
+
+    def isNodeCollapsible(self, node):
+        return self.thistree.isNodeCollapsible((<OcTreeNode>node).thisptr)
+
+    def deleteNodeChild(self, node, int idx):
+        self.thistree.deleteNodeChild((<OcTreeNode>node).thisptr, idx)
+
+    def pruneNode(self, node):
+        return self.thistree.pruneNode((<OcTreeNode>node).thisptr)
+
+    def dynamicEDT_generate(self, maxdist,
+                            np.ndarray[DOUBLE_t, ndim=1] bbx_min,
+                            np.ndarray[DOUBLE_t, ndim=1] bbx_max,
+                            treatUnknownAsOccupied=False):
+        self.edtptr = new edt.DynamicEDTOctomap(<float?>maxdist,
+                                                self.thistree,
+                                                octomap.point3d(bbx_min[0], bbx_min[1], bbx_min[2]),
+                                                octomap.point3d(bbx_max[0], bbx_max[1], bbx_max[2]),
+                                                <cppbool?>treatUnknownAsOccupied)
+
+    def dynamicEDT_checkConsistency(self):
+        if self.edtptr:
+            return self.edtptr.checkConsistency()
+        else:
+            raise NullPointerException
+
+    def dynamicEDT_update(self, updateRealDist):
+        if self.edtptr:
+            self.edtptr.update(<cppbool?>updateRealDist)
+        else:
+            raise NullPointerException
+
+    def dynamicEDT_getMaxDist(self):
+        if self.edtptr:
+            return self.edtptr.getMaxDist()
+        else:
+            raise NullPointerException
+
+    def dynamicEDT_getDistance(self, p):
+        if self.edtptr:
+            if isinstance(p, OcTreeKey):
+                return self.edtptr.getDistance(edt.OcTreeKey(<unsigned short int>p[0],
+                                                             <unsigned short int>p[1],
+                                                             <unsigned short int>p[2]))
+            else:
+                return self.edtptr.getDistance(edt.point3d(<float?>p[0],
+                                                           <float?>p[1],
+                                                           <float?>p[2]))
+        else:
+            raise NullPointerException
+
+
 cdef class OcTree(CollisionGeometry):
     cdef octomap.OcTree* tree
 
-    def __cinit__(self, r, data):
-        cdef std.stringstream ss
-        cdef vector[char] vd = data
-        ss.write(vd.data(), len(data))
+    def __cinit__(self, octree):
 
-        self.tree = new octomap.OcTree(r) 
-        self.tree.readBinaryData(ss)
+        data = octree.write()
+        cdef octomap.istringstream iss
+        cdef ExOcTree tree = ExOcTree(0.1)
+        if data.startswith(b"# Octomap OcTree file"):
+            iss.str(string(<char*?>data, len(data)))
+            del tree.thistree
+            self.tree = <octomap.OcTree*>tree.thistree.read(<octomap.istream&?>iss)
+
+        else:
+            del tree.thistree
+            self.tree = <octomap.OcTree*>tree.thistree.read(string(<char*?>data))
+
         self.thisptr = new defs.OcTree(defs.shared_ptr[octomap.OcTree](self.tree))
-
 
 ###############################################################################
 # Collision managers
@@ -526,13 +1390,13 @@ cdef class DynamicAABBTreeCollisionManager:
         def __get__(self):
             return self.thisptr.octree_as_geometry_collide
         def __set__(self, value):
-            self.thisptr.octree_as_geometry_collide = <bool?> value
+            self.thisptr.octree_as_geometry_collide = <cppbool?> value
 
     property octree_as_geometry_distance:
         def __get__(self):
             return self.thisptr.octree_as_geometry_distance
         def __set__(self, value):
-            self.thisptr.octree_as_geometry_distance = <bool?> value
+            self.thisptr.octree_as_geometry_distance = <cppbool?> value
 
 ###############################################################################
 # Collision and distance functions
@@ -551,10 +1415,10 @@ def collide(CollisionObject o1, CollisionObject o2,
     cdef size_t ret = defs.collide(o1.thisptr, o2.thisptr,
                                    defs.CollisionRequest(
                                        <size_t?> request.num_max_contacts,
-                                       <bool?> request.enable_contact,
+                                       <cppbool?> request.enable_contact,
                                        <size_t?> request.num_max_cost_sources,
-                                       <bool> request.enable_cost,
-                                       <bool> request.use_approximate_cost,
+                                       <cppbool> request.enable_cost,
+                                       <cppbool> request.use_approximate_cost,
                                        <defs.GJKSolverType?> request.gjk_solver_type
                                    ),
                                    cresult)
@@ -612,7 +1476,7 @@ def distance(CollisionObject o1, CollisionObject o2,
 
     cdef double dis = defs.distance(o1.thisptr, o2.thisptr,
                                     defs.DistanceRequest(
-                                        <bool?> request.enable_nearest_points,
+                                        <cppbool?> request.enable_nearest_points,
                                         <defs.GJKSolverType?> request.gjk_solver_type
                                     ),
                                     cresult)
@@ -669,12 +1533,12 @@ cdef class CollisionFunction:
         self.py_func = py_func
         self.py_args = py_args
 
-    cdef bool eval_func(self, defs.CollisionObject*o1, defs.CollisionObject*o2):
+    cdef cppbool eval_func(self, defs.CollisionObject*o1, defs.CollisionObject*o2):
         cdef object py_r = defs.PyObject_CallObject(self.py_func,
                                                     (copy_ptr_collision_object(o1),
                                                      copy_ptr_collision_object(o2),
                                                      self.py_args))
-        return <bool?> py_r
+        return <cppbool?> py_r
 
 cdef class DistanceFunction:
     cdef:
@@ -685,18 +1549,18 @@ cdef class DistanceFunction:
         self.py_func = py_func
         self.py_args = py_args
 
-    cdef bool eval_func(self, defs.CollisionObject*o1, defs.CollisionObject*o2, defs.FCL_REAL& dist):
+    cdef cppbool eval_func(self, defs.CollisionObject*o1, defs.CollisionObject*o2, defs.FCL_REAL& dist):
         cdef object py_r = defs.PyObject_CallObject(self.py_func,
                                                     (copy_ptr_collision_object(o1),
                                                      copy_ptr_collision_object(o2),
                                                      self.py_args))
         (&dist)[0] = <defs.FCL_REAL?> py_r[1]
-        return <bool?> py_r[0]
+        return <cppbool?> py_r[0]
 
-cdef inline bool CollisionCallBack(defs.CollisionObject*o1, defs.CollisionObject*o2, void*cdata):
+cdef inline cppbool CollisionCallBack(defs.CollisionObject*o1, defs.CollisionObject*o2, void*cdata):
     return (<CollisionFunction> cdata).eval_func(o1, o2)
 
-cdef inline bool DistanceCallBack(defs.CollisionObject*o1, defs.CollisionObject*o2, void*cdata, defs.FCL_REAL& dist):
+cdef inline cppbool DistanceCallBack(defs.CollisionObject*o1, defs.CollisionObject*o2, void*cdata, defs.FCL_REAL& dist):
     return (<DistanceFunction> cdata).eval_func(o1, o2, dist)
 
 
@@ -705,19 +1569,19 @@ cdef inline bool DistanceCallBack(defs.CollisionObject*o1, defs.CollisionObject*
 ###############################################################################
 
 cdef quaternion3f_to_numpy(defs.Quaternion3f q):
-    return numpy.array([q.getW(), q.getX(), q.getY(), q.getZ()])
+    return np.array([q.getW(), q.getX(), q.getY(), q.getZ()])
 
 cdef defs.Quaternion3f numpy_to_quaternion3f(a):
     return defs.Quaternion3f(<double?> a[0], <double?> a[1], <double?> a[2], <double?> a[3])
 
 cdef vec3f_to_numpy(defs.Vec3f vec):
-    return numpy.array([vec[0], vec[1], vec[2]])
+    return np.array([vec[0], vec[1], vec[2]])
 
 cdef defs.Vec3f numpy_to_vec3f(a):
     return defs.Vec3f(<double?> a[0], <double?> a[1], <double?> a[2])
 
 cdef mat3f_to_numpy(defs.Matrix3f m):
-    return numpy.array([[m(0,0), m(0,1), m(0,2)],
+    return np.array([[m(0,0), m(0,1), m(0,2)],
                         [m(1,0), m(1,1), m(1,2)],
                         [m(2,0), m(2,1), m(2,2)]])
 

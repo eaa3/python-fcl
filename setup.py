@@ -78,7 +78,10 @@ setup(
         include_dirs = include_dirs,
         library_dirs = lib_dirs,
         libraries=[
-                "fcl","octomap"
+                "fcl",
+                "octomap",
+                "dynamicedt3d",
+                "octomath",
                 ],
         language="c++",
         extra_compile_args = ["-std=c++11"]
