@@ -1,5 +1,6 @@
 import numpy as np
 import fcl
+from fcl.collision_data import GJKSolverType
 
 
 def print_collision_result(o1_name, o2_name, result):
@@ -8,7 +9,8 @@ def print_collision_result(o1_name, o2_name, result):
     print 'Collision?: {}'.format(result.is_collision)
     print 'Number of contacts: {}'.format(len(result.contacts))
     print ''
-
+    if len(result.contacts) > 0:
+      print "Penetration Depth: ", result.contacts[0].penetration_depth
 def print_continuous_collision_result(o1_name, o2_name, result):
     print 'Continuous collision between {} and {}:'.format(o1_name, o2_name)
     print '-'*30
@@ -56,7 +58,7 @@ mesh.addSubModel(verts, tris)
 mesh.endModel()
 
 
-req = fcl.CollisionRequest(enable_contact=True)
+req = fcl.CollisionRequest(enable_contact=True, gjk_solver_type=GJKSolverType.GST_INDEP)
 res = fcl.CollisionResult()
 
 
@@ -66,7 +68,8 @@ n_contacts = fcl.collide(fcl.CollisionObject(mesh, fcl.Transform(np.array([-1.0,
 print_collision_result('Mesh', 'Tree', res)
 
 
-req = fcl.DistanceRequest(enable_nearest_points=True)
+
+req = fcl.DistanceRequest(enable_nearest_points=True, gjk_solver_type=GJKSolverType.GST_INDEP)
 res = fcl.DistanceResult()
 
 dist = fcl.distance(fcl.CollisionObject(mesh, fcl.Transform()),

@@ -6,6 +6,8 @@ def print_collision_result(o1_name, o2_name, result):
     print '-'*30
     print 'Collision?: {}'.format(result.is_collision)
     print 'Number of contacts: {}'.format(len(result.contacts))
+    if len(result.contacts) > 0:
+      print "Penetration Depth: ", result.contacts[0].penetration_depth
     print ''
 
 def print_continuous_collision_result(o1_name, o2_name, result):
