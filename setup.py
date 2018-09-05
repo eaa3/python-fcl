@@ -18,10 +18,12 @@ platform_supported = False
 for prefix in ['darwin', 'linux', 'bsd']:
     if prefix in sys.platform:
         platform_supported = True
-        include_dirs = ['/usr/include',
+        include_dirs = [os.environ['HOME'] + '/.local/include',
+                        '/usr/include',
                         '/usr/local/include',
                         '/usr/include/eigen3']
-        lib_dirs = ['/usr/lib',
+        lib_dirs = [os.environ['HOME'] + '/.local/lib',
+                    '/usr/lib',
                     '/usr/local/lib']
         
         if 'CPATH' in os.environ:
