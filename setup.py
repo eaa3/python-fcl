@@ -18,13 +18,24 @@ platform_supported = False
 for prefix in ['darwin', 'linux', 'bsd']:
     if prefix in sys.platform:
         platform_supported = True
-        include_dirs = [os.environ['HOME'] + '/.local/include',
-                        '/usr/include',
-                        '/usr/local/include',
-                        '/usr/include/eigen3']
-        lib_dirs = [os.environ['HOME'] + '/.local/lib',
-                    '/usr/lib',
-                    '/usr/local/lib']
+        local_install_prefix = None
+        optional_include_dir = []
+        optional_lib_dir = []
+        try:
+            local_install_prefix = os.environ['LOCAL_INSTALL_PREFIX']
+            optional_include_dir = [local_install_prefix + '/include']
+            optional_lib_dir = [local_install_prefix + '/lib']
+        except:
+            pass
+
+        
+        include_dirs = optional_include_dir + [os.environ['HOME'] + '/.local/include',
+                                               '/usr/include',
+                                               '/usr/local/include',
+                                               '/usr/include/eigen3']
+        lib_dirs = optional_lib_dir + [os.environ['HOME'] + '/.local/lib',
+                                       '/usr/lib',
+                                       '/usr/local/lib']
         
         if 'CPATH' in os.environ:
             include_dirs += os.environ['CPATH'].split(':')
